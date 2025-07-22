@@ -1,0 +1,103 @@
+import os
+import pandas as pd
+import torch
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer, util
+from datetime import datetime
+
+# Step 1: 加载数据
+data_dir = r"C:\Users\别雨辰\Desktop\专利"
+years = list(range(1985, 2025))  # 示例年份
+
+patent_texts = []
+patent_dates = []
+patent_ids = []
+
+for year in years:
+    file_path = os.path.join(data_dir, f"{year}.xlsx")
+    df = pd.read_excel(file_path, header=0)
+
+    df = df[[df.columns[0], df.columns[1], df.columns[4], df.columns[6],
+             df.columns[18], df.columns[20], df.columns[22]]]
+    df.columns = ["patent_type", "id", "apply_date", "auth_date", "claim", "abstract", "name"]
+
+    # 只保留有 claim 或 abstract 的专利
+    df.dropna(subset=["claim", "abstract"], how="all", inplace=True)
+
+
+    # 确定专利时间
+    def get_date(row):
+        if row["patent_type"] == "发明公开":
+            return row["apply_date"]
+        else:
+            return row["auth_date"]
+
+
+    df["date"] = df.apply(get_date, axis=1)
+    df.dropna(subset=["date"], inplace=True)
+
+    # 统一时间格式
+    df["date"] = pd.to_datetime(df["date"], format="%Y-%m-%d", errors="coerce")
+    df.dropna(subset=["date"], inplace=True)
+
+    # 生成文本（claim + abstract）
+    df["claim"] = df["claim"].fillna("")
+    df["abstract"] = df["abstract"].fillna("")
+    df["fulltext"] = df["abstract"] + "。" + df["claim"]
+
+    # 收集
+    patent_texts.extend(df["fulltext"].tolist())
+    patent_dates.extend(df["date"].tolist())
+    patent_ids.extend(df["id"].tolist())
+
+# Step 2: BERT 编码
+model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
+embeddings = model.encode(patent_texts, convert_to_tensor=True, show_progress_bar=True)
+
+# Step 3: 计算相似度矩阵
+cos_sim_matrix = util.pytorch_cos_sim(embeddings, embeddings)
+
+# Step 4: 基于时间分组，计算创新性指标：后 / 前 的平均相似度
+n = len(patent_texts)
+novelty_score = []
+
+for i in tqdm(range(n), desc="计算创新性指标"):
+    time_i = patent_dates[i]
+
+    # 找出时间在它之后和之前的专利索引
+    later_indices = [j for j in range(n) if patent_dates[j] > time_i]
+    earlier_indices = [j for j in range(n) if patent_dates[j] < time_i]
+
+    if len(earlier_indices) == 0 or len(later_indices) == 0:
+        novelty_score.append(float('nan'))  # 无法计算，标记为NaN
+        continue
+
+    sim_to_later = cos_sim_matrix[i, later_indices].mean().item()
+    sim_to_earlier = cos_sim_matrix[i, earlier_indices].mean().item()
+
+    # 防止除0
+    if sim_to_earlier == 0:
+        novelty_score.append(float('inf'))
+    else:
+        novelty_score.append(sim_to_later / sim_to_earlier)
+
+novelty_score = torch.tensor(novelty_score)
+
+"""
+# Step 5: 输出前10最具“突破性”的专利（越大越新颖）
+topk = torch.topk(novelty_score, k=10, largest=True)
+for idx in topk.indices:
+    print(f"专利编号: {patent_ids[idx]}, 时间: {patent_dates[idx].date()}, 创新得分: {novelty_score[idx]:.4f}")
+    print(f"内容预览：{patent_texts[idx][:80]}...\n")
+"""
+
+result_df = pd.DataFrame({
+    "patent_id": patent_ids,
+    "date": [d.date() for d in patent_dates],
+    "novelty_score": novelty_score.tolist()
+})
+
+# 去掉无法计算的 NaN 或 inf
+result_df = result_df.replace([float('inf')], pd.NA).dropna()
+
+result_df.to_csv("bert_patent_quality.csv", index=False)
