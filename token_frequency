@@ -1,0 +1,113 @@
+import os
+import pandas as pd
+import numpy as np
+import re
+from collections import Counter, defaultdict
+from math import log
+from tqdm import tqdm
+
+folder_path = r"C:\Users\别雨辰\Desktop\专利"
+
+# 分词函数：去掉标点和数字，仅保留中文或英文单词
+def tokenize(text):
+    if pd.isna(text):
+        return []
+    # 去除所有非中英文字符（包括标点、数字）
+    text = re.sub(r"[^\u4e00-\u9fa5a-zA-Z]", " ", text)
+    words = text.lower().split()
+    return words
+
+# 存储所有专利信息
+all_patents = []
+word_document_frequency = defaultdict(int)
+total_documents = 0
+
+# 读取所有年份的数据
+for year in tqdm(range(1985, 2025)):
+    file_path = os.path.join(folder_path, f"{year}.xlsx")
+    if not os.path.exists(file_path):
+        continue
+    df = pd.read_excel(file_path)
+    for i, row in df.iterrows():
+        patent_type = row[0]
+        patent_apply_num  = row[1]
+        publish_date = row[4] if patent_type == "发明公开" else row[6]
+        date = pd.to_datetime(publish_date)
+        text1 = str(row[18]) if not pd.isna(row[18]) else ""
+        text2 = str(row[20]) if not pd.isna(row[20]) else ""
+        text = text1 + " " + text2
+        if not text.strip():
+            continue
+        tokens = tokenize(text)
+        if not tokens:
+            continue
+        tf = Counter(tokens)
+        all_patents.append({
+            "patent_apply_num": patent_apply_num,
+            "date": date,
+            "year": date.year,
+            "tf": tf,
+            "tokens": set(tf.keys())
+        })
+        total_documents += 1
+        for token in tf.keys():
+            word_document_frequency[token] += 1
+
+# 构造 TF * IDF
+for patent in all_patents:
+    date = patent["date"]
+    tokens = patent["tokens"]
+    tfidf = {}
+    earlier_docs = [p for p in all_patents if p["date"] < date]
+    earlier_doc_count = len(earlier_docs)
+    for token in tokens:
+        df_token = sum(1 for p in earlier_docs if token in p["tokens"])
+        idf = log((earlier_doc_count + 1) / (df_token + 1))
+        # 文献中分子没有+1
+        tfidf[token] = patent["tf"][token] * idf
+    patent["vector"] = tfidf
+
+# 修正版本：相似度按“严格时间先后”判断（精确到天），而不是“跨年份”
+
+# 计算相似度矩阵
+similarity = np.zeros((len(all_patents), len(all_patents)))
+
+for i in tqdm(range(len(all_patents))):
+    vec_i = all_patents[i]["vector"]
+    norm_i = sum(v ** 2 for v in vec_i.values()) ** 0.5
+    date_i = all_patents[i]["date"]
+    for j in range(i + 1, len(all_patents)):
+        date_j = all_patents[j]["date"]
+        if date_i == date_j:
+            continue  # 同一天不计相似度
+        vec_j = all_patents[j]["vector"]
+        norm_j = sum(v ** 2 for v in vec_j.values()) ** 0.5
+        common_keys = set(vec_i.keys()) & set(vec_j.keys())
+        dot_product = sum(vec_i[k] * vec_j[k] for k in common_keys)
+        if norm_i > 0 and norm_j > 0:
+            sim = dot_product / (norm_i * norm_j)
+            similarity[i][j] = sim
+            similarity[j][i] = sim
+
+# 计算质量指标（以后 / 以前）
+qualities = []
+for i in range(len(all_patents)):
+    date_i = all_patents[i]["date"]
+    before = [j for j in range(len(all_patents)) if all_patents[j]["date"] < date_i]
+    after = [j for j in range(len(all_patents)) if all_patents[j]["date"] > date_i]
+    sum_before = sum(similarity[i][j] for j in before)
+    sum_after = sum(similarity[i][j] for j in after)
+    if sum_before > 0:
+        quality = sum_after / sum_before
+    else:
+        quality = np.nan
+    qualities.append(quality)
+
+# 输出
+output_df = pd.DataFrame({
+    "patent_apply_num": [p["patent_apply_num"] for p in all_patents],
+    "date": [p["date"] for p in all_patents],
+    "quality": qualities
+})
+output_df.to_csv("patent_quality.csv", index=False)
+
